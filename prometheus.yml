@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 30s
+
+scrape_configs:
+  - job_name: telemt
+    static_configs:
+      - targets: ['telemt-exporter:9101']
