@@ -230,7 +230,7 @@ func (c *TelemtCollector) get(url string) ([]byte, error) {
 		return nil, err
 	}
 	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Authorization", c.token)
 	}
 
 	resp, err := c.client.Do(req)
