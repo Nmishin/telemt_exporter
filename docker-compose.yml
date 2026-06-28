@@ -5,7 +5,7 @@ services:
     ports:
       - "9101:9101"
     command:
-      - -url=http://telemt:54321   # адрес telemt внутри docker-сети
+      - -url=http://telemt:54321   # telemt hostname inside docker network
       - -token=${TELEMT_TOKEN}
       - -listen=:9101
 

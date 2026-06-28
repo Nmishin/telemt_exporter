@@ -1,21 +1,36 @@
 # telemt-exporter
 
-Prometheus-экспортер для [telemt](https://github.com/telemt/telemt) / telemt-ui.
+Prometheus exporter for [telemt](https://github.com/telemt/telemt) — MTProxy on Rust.
 
-## Метрики
+Scrapes two telemt API endpoints and exposes Prometheus metrics on `:9101`.
 
-| Метрика | Тип | Описание |
+## Metrics
+
+### Per-token (from /v1/stats/users)
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `telemt_user_traffic_bytes_total` | Counter | `username` | Total traffic (upload + download) |
+| `telemt_user_active_connections` | Gauge | `username` | Current active connections |
+
+### Per-instance (from /v1/stats/zero/all)
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `telemt_connections_total` | Counter | — | Total connection attempts |
+| `telemt_connections_bad_total` | Counter | — | Failed connection attempts |
+| `telemt_connections_bad_by_class` | Counter | `class` | Failed connections grouped by reason |
+| `telemt_handshake_failures_by_class` | Counter | `class` | Handshake failures grouped by reason |
+
+### Health
+
+| Metric | Type | Description |
 |---|---|---|
-| `telemt_user_traffic_up_bytes_total` | Counter | Байт отправлено пользователем |
-| `telemt_user_traffic_down_bytes_total` | Counter | Байт получено пользователем |
-| `telemt_user_active_connections` | Gauge | Активные соединения |
-| `telemt_scrape_up` | Gauge | 1 = последний scrape успешен |
+| `telemt_scrape_up` | Gauge | 1 = both endpoints responded successfully |
 
-Все метрики по трафику имеют лейблы `user_id` и `username`.
+## Usage
 
-## Запуск
-
-### Собрать и запустить локально
+### Build and run locally
 
 ```bash
 go mod tidy
@@ -29,39 +44,27 @@ go build -o telemt-exporter .
 TELEMT_TOKEN=your_token docker compose up -d
 ```
 
-Метрики доступны на `http://localhost:9101/metrics`.
+Metrics are available at `http://localhost:9101/metrics`.
 
-## Настройка
+## Configuration
 
-| Флаг | По умолчанию | Описание |
+| Flag | Default | Description |
 |---|---|---|
-| `-url` | `http://localhost:54321` | Базовый URL telemt |
-| `-token` | `` | Bearer-токен для API |
-| `-listen` | `:9101` | Адрес для экспорта метрик |
-
-## Адаптация под твой API
-
-В `main.go` нужно подогнать две вещи:
-
-1. **Структура `User`** — поля должны совпадать с JSON от твоего telemt
-2. **Endpoint** в `fetchUsers()` — сейчас `/api/users`, поменяй если у тебя другой путь
-
-Чтобы посмотреть что отдаёт API:
-```bash
-curl -H "Authorization: Bearer TOKEN" http://localhost:54321/api/users | jq .
-```
+| `-url` | `http://localhost:54321` | telemt API base URL |
+| `-token` | `""` | Bearer token for API auth |
+| `-listen` | `:9101` | Address to expose metrics on |
 
 ## Grafana
 
-Полезные PromQL-запросы:
+Ready-to-import dashboard: [`grafana-dashboard.json`](grafana-dashboard.json)
+(Grafana → Dashboards → New → Import).
 
-```promql
-# Скорость загрузки по пользователям (байт/сек за последние 5 мин)
-rate(telemt_user_traffic_down_bytes_total[5m])
-
-# Топ-5 по суммарному трафику
-topk(5, telemt_user_traffic_up_bytes_total + telemt_user_traffic_down_bytes_total)
-
-# Активные соединения сейчас
-telemt_user_active_connections
-```
+Panels:
+- Connection rate (connections/s)
+- Good vs bad connections (green/red)
+- Failure rate (% — thresholds at 5% and 10%)
+- Active connections per token
+- Traffic by token (bytes/s)
+- Bad connections by reason (range total, top-10)
+- Handshake failures by reason (range total, top-10)
+- Scrape status (1 = OK)

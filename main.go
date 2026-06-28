@@ -14,61 +14,112 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// telemt API types
-// Подгони под реальные поля своего /api/users или /api/inbounds
+// /v1/stats/users types
 // ---------------------------------------------------------------------------
 
 type User struct {
-	ID          string `json:"id"`
-	Username    string `json:"username"`
-	UpBytes     int64  `json:"up"`     // байт отправлено
-	DownBytes   int64  `json:"down"`   // байт получено
-	Connections int    `json:"connections"` // активные соединения
-	Enabled     bool   `json:"enable"`
+	Username           string `json:"username"`
+	Enabled            bool   `json:"enabled"`
+	CurrentConnections int64  `json:"current_connections"`
+	TotalOctets        int64  `json:"total_octets"`
 }
 
-type TelemtResponse struct {
-	Success bool   `json:"success"`
-	Users   []User `json:"obj"` // telemt-ui обычно кладёт список в поле "obj"
+type UsersResponse struct {
+	Ok       bool   `json:"ok"`
+	Data     []User `json:"data"`
+	Revision string `json:"revision"`
 }
 
 // ---------------------------------------------------------------------------
-// Коллектор
+// /v1/stats/zero/all types
+// ---------------------------------------------------------------------------
+
+type ClassCount struct {
+	Class string `json:"class"`
+	Total int64  `json:"total"`
+}
+
+type ZeroCoreData struct {
+	ConnectionsTotal          int64        `json:"connections_total"`
+	ConnectionsBadTotal       int64        `json:"connections_bad_total"`
+	ConnectionsBadByClass     []ClassCount `json:"connections_bad_by_class"`
+	HandshakeFailuresByClass  []ClassCount `json:"handshake_failures_by_class"`
+	HandshakeTimeoutsTotal    int64        `json:"handshake_timeouts_total"`
+	AcceptPermitTimeoutTotal  int64        `json:"accept_permit_timeout_total"`
+	ConfiguredUsers           int          `json:"configured_users"`
+}
+
+type ZeroAllData struct {
+	Core ZeroCoreData `json:"core"`
+}
+
+type ZeroAllResponse struct {
+	Ok       bool        `json:"ok"`
+	Data     ZeroAllData `json:"data"`
+	Revision string      `json:"revision"`
+}
+
+// ---------------------------------------------------------------------------
+// Collector
 // ---------------------------------------------------------------------------
 
 type TelemtCollector struct {
-	baseURL  string
-	token    string
-	client   *http.Client
+	baseURL string
+	token   string
+	client  *http.Client
 
-	upBytes     *prometheus.Desc
-	downBytes   *prometheus.Desc
-	connections *prometheus.Desc
-	scrapeUp    *prometheus.Desc
+	// From /v1/stats/users
+	userTraffic     *prometheus.Desc
+	userConnections *prometheus.Desc
+
+	// From /v1/stats/zero/all
+	connectionsTotal          *prometheus.Desc
+	connectionsBadTotal       *prometheus.Desc
+	connectionsBadByClass     *prometheus.Desc
+	handshakeFailuresByClass  *prometheus.Desc
+
+	// Scrape status
+	scrapeUp *prometheus.Desc
 }
 
 func NewTelemtCollector(baseURL, token string) *TelemtCollector {
-	labels := []string{"user_id", "username"}
 	return &TelemtCollector{
 		baseURL: baseURL,
 		token:   token,
 		client:  &http.Client{Timeout: 10 * time.Second},
 
-		upBytes: prometheus.NewDesc(
-			"telemt_user_traffic_up_bytes_total",
-			"Total bytes sent (upload) by user",
-			labels, nil,
+		userTraffic: prometheus.NewDesc(
+			"telemt_user_traffic_bytes_total",
+			"Total bytes transferred by user (upload + download)",
+			[]string{"username"}, nil,
 		),
-		downBytes: prometheus.NewDesc(
-			"telemt_user_traffic_down_bytes_total",
-			"Total bytes received (download) by user",
-			labels, nil,
-		),
-		connections: prometheus.NewDesc(
+		userConnections: prometheus.NewDesc(
 			"telemt_user_active_connections",
 			"Current active connections for user",
-			labels, nil,
+			[]string{"username"}, nil,
 		),
+
+		connectionsTotal: prometheus.NewDesc(
+			"telemt_connections_total",
+			"Total connection attempts (good + bad) since process start",
+			nil, nil,
+		),
+		connectionsBadTotal: prometheus.NewDesc(
+			"telemt_connections_bad_total",
+			"Total failed connection attempts since process start",
+			nil, nil,
+		),
+		connectionsBadByClass: prometheus.NewDesc(
+			"telemt_connections_bad_by_class",
+			"Failed connection attempts grouped by failure class",
+			[]string{"class"}, nil,
+		),
+		handshakeFailuresByClass: prometheus.NewDesc(
+			"telemt_handshake_failures_by_class",
+			"Handshake failures grouped by failure class",
+			[]string{"class"}, nil,
+		),
+
 		scrapeUp: prometheus.NewDesc(
 			"telemt_scrape_up",
 			"1 if last scrape of telemt API succeeded",
@@ -78,46 +129,106 @@ func NewTelemtCollector(baseURL, token string) *TelemtCollector {
 }
 
 func (c *TelemtCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.upBytes
-	ch <- c.downBytes
-	ch <- c.connections
+	ch <- c.userTraffic
+	ch <- c.userConnections
+	ch <- c.connectionsTotal
+	ch <- c.connectionsBadTotal
+	ch <- c.connectionsBadByClass
+	ch <- c.handshakeFailuresByClass
 	ch <- c.scrapeUp
 }
 
 func (c *TelemtCollector) Collect(ch chan<- prometheus.Metric) {
+	allOk := true
+
 	users, err := c.fetchUsers()
 	if err != nil {
-		log.Printf("ERROR fetching telemt users: %v", err)
-		ch <- prometheus.MustNewConstMetric(c.scrapeUp, prometheus.GaugeValue, 0)
-		return
+		log.Printf("ERROR fetching /v1/stats/users: %v", err)
+		allOk = false
+	} else {
+		for _, u := range users {
+			ch <- prometheus.MustNewConstMetric(
+				c.userTraffic, prometheus.CounterValue, float64(u.TotalOctets), u.Username,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.userConnections, prometheus.GaugeValue, float64(u.CurrentConnections), u.Username,
+			)
+		}
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.scrapeUp, prometheus.GaugeValue, 1)
-
-	for _, u := range users {
-		id := u.ID
-		name := u.Username
-
+	zero, err := c.fetchZeroAll()
+	if err != nil {
+		log.Printf("ERROR fetching /v1/stats/zero/all: %v", err)
+		allOk = false
+	} else {
 		ch <- prometheus.MustNewConstMetric(
-			c.upBytes, prometheus.CounterValue, float64(u.UpBytes), id, name,
+			c.connectionsTotal, prometheus.CounterValue, float64(zero.Core.ConnectionsTotal),
 		)
 		ch <- prometheus.MustNewConstMetric(
-			c.downBytes, prometheus.CounterValue, float64(u.DownBytes), id, name,
+			c.connectionsBadTotal, prometheus.CounterValue, float64(zero.Core.ConnectionsBadTotal),
 		)
-		ch <- prometheus.MustNewConstMetric(
-			c.connections, prometheus.GaugeValue, float64(u.Connections), id, name,
-		)
+		for _, cc := range zero.Core.ConnectionsBadByClass {
+			ch <- prometheus.MustNewConstMetric(
+				c.connectionsBadByClass, prometheus.CounterValue, float64(cc.Total), cc.Class,
+			)
+		}
+		for _, fc := range zero.Core.HandshakeFailuresByClass {
+			ch <- prometheus.MustNewConstMetric(
+				c.handshakeFailuresByClass, prometheus.CounterValue, float64(fc.Total), fc.Class,
+			)
+		}
 	}
+
+	scrapeVal := 0.0
+	if allOk {
+		scrapeVal = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(c.scrapeUp, prometheus.GaugeValue, scrapeVal)
 }
 
-func (c *TelemtCollector) fetchUsers() ([]User, error) {
-	url := fmt.Sprintf("%s/api/users", c.baseURL) // ← подгони endpoint
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
 
-	req, err := http.NewRequest("GET", url, nil)
+func (c *TelemtCollector) fetchUsers() ([]User, error) {
+	url := fmt.Sprintf("%s/v1/stats/users", c.baseURL)
+	body, err := c.get(url)
 	if err != nil {
 		return nil, err
 	}
 
+	var result UsersResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("json parse error: %w", err)
+	}
+	if !result.Ok {
+		return nil, fmt.Errorf("telemt API returned ok=false")
+	}
+	return result.Data, nil
+}
+
+func (c *TelemtCollector) fetchZeroAll() (*ZeroAllData, error) {
+	url := fmt.Sprintf("%s/v1/stats/zero/all", c.baseURL)
+	body, err := c.get(url)
+	if err != nil {
+		return nil, err
+	}
+
+	var result ZeroAllResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("json parse error: %w", err)
+	}
+	if !result.Ok {
+		return nil, fmt.Errorf("telemt API returned ok=false")
+	}
+	return &result.Data, nil
+}
+
+func (c *TelemtCollector) get(url string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
@@ -136,17 +247,7 @@ func (c *TelemtCollector) fetchUsers() ([]User, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var result TelemtResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("json parse error: %w", err)
-	}
-
-	if !result.Success {
-		return nil, fmt.Errorf("telemt API returned success=false")
-	}
-
-	return result.Users, nil
+	return body, nil
 }
 
 // ---------------------------------------------------------------------------
